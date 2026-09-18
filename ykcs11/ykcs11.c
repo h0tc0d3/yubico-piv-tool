@@ -126,6 +126,15 @@ static void cleanup_slot(ykcs11_slot_t *slot) {
   slot->n_objects = 0;
 }
 
+// Reset the state that must not survive the closing of the last session on a
+// slot (i.e. log the application out), while keeping the cached token objects.
+// The objects belong to the token, not to the session, and re-reading them from
+// the card is expensive (one APDU per object plus X.509 parsing), so they are
+// only discarded on token removal (C_GetSlotList), C_InitToken or C_Finalize.
+static void reset_slot_login(ykcs11_slot_t *slot) {
+  slot->login_state = YKCS11_PUBLIC;
+}
+
 /* General Purpose */
 
 CK_DEFINE_FUNCTION(CK_RV, C_Initialize)(
@@ -462,6 +471,14 @@ CK_DEFINE_FUNCTION(CK_RV, C_GetSlotList)(
 
       DBG("Failed to validate %s: %s", reader, ykpiv_strerror(rc));
 
+      if(slot->slot_info.flags & CKF_TOKEN_PRESENT) {
+        // The token disappeared: drop the cached objects so a card inserted
+        // later is not served stale data.
+        locking.pfnLockMutex(slot->mutex);
+        cleanup_slot(slot);
+        locking.pfnUnlockMutex(slot->mutex);
+      }
+
       slot->login_state = YKCS11_PUBLIC;
       slot->slot_info.flags &= ~CKF_TOKEN_PRESENT;
 
@@ -508,6 +525,11 @@ CK_DEFINE_FUNCTION(CK_RV, C_GetSlotList)(
       DBG("Disconnecting slot %lu", i);
       ykpiv_disconnect(slots[i].piv_state);
       slots[i].slot_info.flags &= ~CKF_TOKEN_PRESENT;
+      // The cached token objects belong to the removed token, drop them so a
+      // different token inserted later is not served stale data.
+      locking.pfnLockMutex(slots[i].mutex);
+      cleanup_slot(slots + i);
+      locking.pfnUnlockMutex(slots[i].mutex);
     }
   }
 
@@ -903,6 +925,9 @@ CK_DEFINE_FUNCTION(CK_RV, C_InitToken)(
     goto inittoken_out;
   }
 
+  // The applet was reset, so every cached object is gone
+  cleanup_slot(slot);
+
   locking.pfnUnlockMutex(slot->mutex);
   rv = CKR_OK;
 
@@ -1188,7 +1213,7 @@ CK_DEFINE_FUNCTION(CK_RV, C_CloseSession)(
 
   if(other_sessions == 0) {
     locking.pfnLockMutex(slot->mutex);
-    cleanup_slot(slot);
+    reset_slot_login(slot);
     locking.pfnUnlockMutex(slot->mutex);
   }
   rv = CKR_OK;
@@ -1239,7 +1264,7 @@ CK_DEFINE_FUNCTION(CK_RV, C_CloseAllSessions)(
 
   if(cleaned_sessions > 0) {
     locking.pfnLockMutex(slots[slotID].mutex);
-    cleanup_slot(slots + slotID);
+    reset_slot_login(slots + slotID);
     locking.pfnUnlockMutex(slots[slotID].mutex);
   }
   rv = CKR_OK;
