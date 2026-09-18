@@ -51,6 +51,21 @@
 #define YKCS11_MAX_SLOTS       64
 #define YKCS11_MAX_SESSIONS    16
 
+static CK_BBOOL token_info_valid[YKCS11_MAX_SLOTS] = { FALSE };
+static CK_TOKEN_INFO cached_token_info[YKCS11_MAX_SLOTS];
+
+// State used only for reader discovery in C_GetSlotList. Establishing a PC/SC
+// context on every call can dominate the cost of C_GetSlotList on some
+// platforms, so it is created once and reused. It is only touched while
+// holding global_mutex, so it needs no lock of its own.
+static ykpiv_state *reader_state = NULL;
+
+static void invalidate_token_info_caches(void) {
+  for (size_t i = 0; i < YKCS11_MAX_SLOTS; i++) {
+    token_info_valid[i] = FALSE;
+  }
+}
+
 static ykcs11_slot_t slots[YKCS11_MAX_SLOTS];
 static CK_ULONG      n_slots = 0;
 
@@ -117,6 +132,7 @@ CK_DEFINE_FUNCTION(CK_RV, C_Initialize)(
   CK_VOID_PTR pInitArgs
 )
 {
+  invalidate_token_info_caches();
 #if YKCS11_DBG
   verbose = YKCS11_DBG;
 #else
@@ -216,6 +232,7 @@ CK_DEFINE_FUNCTION(CK_RV, C_Finalize)(
   CK_VOID_PTR pReserved
 )
 {
+  invalidate_token_info_caches();
   DIN;
 
   CK_RV rv;
@@ -247,6 +264,12 @@ CK_DEFINE_FUNCTION(CK_RV, C_Finalize)(
       ykpiv_done(slots[i].piv_state);
     }
     locking.pfnDestroyMutex(slots[i].mutex);
+  }
+
+  // Release the reader-discovery state
+  if (reader_state) {
+    ykpiv_done(reader_state);
+    reader_state = NULL;
   }
 
   memset(&slots, 0, sizeof(slots));
@@ -342,9 +365,6 @@ CK_DEFINE_FUNCTION(CK_RV, C_GetSlotList)(
 )
 {
   DIN;
-  char readers[2048] = {0};
-  size_t len = sizeof(readers);
-  ykpiv_rc rc;
   CK_RV rv;
 
   if (!pid) {
@@ -359,23 +379,37 @@ CK_DEFINE_FUNCTION(CK_RV, C_GetSlotList)(
     goto slotlist_out;
   }
 
-  ykpiv_state *piv_state;
-  if ((rc = ykpiv_init(&piv_state, verbose)) != YKPIV_OK) {
-    DBG("Unable to initialize libykpiv: %s", ykpiv_strerror(rc));
-    rv = CKR_FUNCTION_FAILED;
-    goto slotlist_out;
+  char readers[2048] = {0};
+  size_t len = sizeof(readers);
+  ykpiv_rc rc;
+
+  locking.pfnLockMutex(global_mutex);
+
+  // The scan below may add or remove slots and (dis)connect tokens, so the
+  // cached token info may be stale from here on.
+  invalidate_token_info_caches();
+
+  // Lazily create and keep a state for reader discovery. Re-establishing a
+  // PC/SC context on every call can dominate the cost of C_GetSlotList, while
+  // reusing a single context makes the reader scan almost free.
+  if (reader_state == NULL) {
+    if ((rc = ykpiv_init(&reader_state, verbose)) != YKPIV_OK) {
+      DBG("Unable to initialize libykpiv: %s", ykpiv_strerror(rc));
+      locking.pfnUnlockMutex(global_mutex);
+      rv = CKR_FUNCTION_FAILED;
+      goto slotlist_out;
+    }
   }
 
-  if ((rc = ykpiv_list_readers(piv_state, readers, &len)) != YKPIV_OK) {
+  if ((rc = ykpiv_list_readers(reader_state, readers, &len)) != YKPIV_OK) {
     DBG("Unable to list readers: %s", ykpiv_strerror(rc));
-    ykpiv_done(piv_state);
+    // Drop the state so the next call starts from a fresh context.
+    ykpiv_done(reader_state);
+    reader_state = NULL;
+    locking.pfnUnlockMutex(global_mutex);
     rv = CKR_DEVICE_ERROR;
     goto slotlist_out;
   }
-
-  ykpiv_done(piv_state);
-
-  locking.pfnLockMutex(global_mutex);
 
   // Mark existing slots as candidates for disconnect
   bool mark[YKCS11_MAX_SLOTS] = { false };
@@ -477,20 +511,28 @@ CK_DEFINE_FUNCTION(CK_RV, C_GetSlotList)(
     }
   }
 
-  // Count and return slots with or without tokens as requested
+  // Count slots with or without tokens as requested
   CK_ULONG count = 0;
   for (CK_ULONG i = 0; i < n_slots; i++) {
     if(!tokenPresent || (slots[i].slot_info.flags & CKF_TOKEN_PRESENT)) {
-      if(pSlotList) {
-        if(count >= *pulCount) {
-          DBG("Buffer too small: needed %lu, provided %lu", count, *pulCount);
-          locking.pfnUnlockMutex(global_mutex);
-          rv = CKR_BUFFER_TOO_SMALL;
-          goto slotlist_out;
-        }
-        pSlotList[count] = i;
-      }
       count++;
+    }
+  }
+
+  if (pSlotList && count > *pulCount) {
+    DBG("Buffer too small: needed %lu, provided %lu", count, *pulCount);
+    *pulCount = count;
+    locking.pfnUnlockMutex(global_mutex);
+    rv = CKR_BUFFER_TOO_SMALL;
+    goto slotlist_out;
+  }
+
+  if (pSlotList) {
+    CK_ULONG idx = 0;
+    for (CK_ULONG i = 0; i < n_slots; i++) {
+      if(!tokenPresent || (slots[i].slot_info.flags & CKF_TOKEN_PRESENT)) {
+        pSlotList[idx++] = i;
+      }
     }
   }
 
@@ -575,6 +617,13 @@ CK_DEFINE_FUNCTION(CK_RV, C_GetTokenInfo)(
     goto tokeninfo_out;
   }
 
+  if (token_info_valid[slotID]) {
+    memcpy(pInfo, &cached_token_info[slotID], sizeof(CK_TOKEN_INFO));
+    locking.pfnUnlockMutex(global_mutex);
+    rv = CKR_OK;
+    goto tokeninfo_out;
+  }
+
   if(!(slots[slotID].slot_info.flags & CKF_TOKEN_PRESENT)) {
     DBG("A token is not present in slot %lu", slotID);
     locking.pfnUnlockMutex(global_mutex);
@@ -602,7 +651,7 @@ CK_DEFINE_FUNCTION(CK_RV, C_GetTokenInfo)(
   }
 
   for(int i = 0; i < YKCS11_MAX_SESSIONS; i++) {
-    if(sessions[i].slot) {
+    if(sessions[i].slot == &slots[slotID]) {
       if(sessions[i].info.flags & CKF_RW_SESSION) {
         pInfo->ulRwSessionCount++;
       }
@@ -611,6 +660,9 @@ CK_DEFINE_FUNCTION(CK_RV, C_GetTokenInfo)(
       }
     }
   }
+
+  memcpy(&cached_token_info[slotID], pInfo, sizeof(CK_TOKEN_INFO));
+  token_info_valid[slotID] = TRUE;
 
   locking.pfnUnlockMutex(global_mutex);
   rv = CKR_OK;
@@ -759,6 +811,10 @@ CK_DEFINE_FUNCTION(CK_RV, C_InitToken)(
 
   locking.pfnLockMutex(global_mutex);
 
+  // The PINs are about to be blocked and the applet reset, so cached
+  // token info is stale
+  invalidate_token_info_caches();
+
   if (slotID >= n_slots) {
     DBG("Invalid slot ID %lu", slotID);
     locking.pfnUnlockMutex(global_mutex);
@@ -883,6 +939,12 @@ CK_DEFINE_FUNCTION(CK_RV, C_SetPIN)(
     rv = CKR_CRYPTOKI_NOT_INITIALIZED;
     goto setpin_out;
   }
+
+  // A PIN change (or a failed verification of the old PIN) may change the
+  // PIN retry count, so cached token info is stale
+  locking.pfnLockMutex(global_mutex);
+  invalidate_token_info_caches();
+  locking.pfnUnlockMutex(global_mutex);
   
   ykcs11_session_t* session = get_session(hSession);
 
@@ -973,6 +1035,9 @@ CK_DEFINE_FUNCTION(CK_RV, C_OpenSession)(
   session->info.slotID = slotID;
   session->info.flags = flags;
   session->slot = slots + slotID;
+
+  // The session counts reported by C_GetTokenInfo changed
+  invalidate_token_info_caches();
 
   locking.pfnUnlockMutex(global_mutex);
   locking.pfnLockMutex(session->slot->mutex);
@@ -1109,6 +1174,9 @@ CK_DEFINE_FUNCTION(CK_RV, C_CloseSession)(
 
   cleanup_session(session);
 
+  // The session counts reported by C_GetTokenInfo changed
+  invalidate_token_info_caches();
+
   for(int i = 0; i < YKCS11_MAX_SESSIONS; i++) {
     session = sessions + i;
     if(session->slot == slot) {
@@ -1160,6 +1228,11 @@ CK_DEFINE_FUNCTION(CK_RV, C_CloseAllSessions)(
       cleanup_session(session);
       cleaned_sessions++;
     }
+  }
+
+  if (cleaned_sessions > 0) {
+    // The session counts reported by C_GetTokenInfo changed
+    invalidate_token_info_caches();
   }
 
   locking.pfnUnlockMutex(global_mutex);
@@ -1270,6 +1343,12 @@ CK_DEFINE_FUNCTION(CK_RV, C_Login)(
     rv = CKR_CRYPTOKI_NOT_INITIALIZED;
     goto login_out;
   }
+
+  // A failed login attempt decreases the PIN retry count, so cached
+  // token info is stale
+  locking.pfnLockMutex(global_mutex);
+  invalidate_token_info_caches();
+  locking.pfnUnlockMutex(global_mutex);
 
   if (userType != CKU_SO &&
       userType != CKU_USER &&
