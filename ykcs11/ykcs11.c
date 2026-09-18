@@ -981,6 +981,9 @@ CK_DEFINE_FUNCTION(CK_RV, C_OpenSession)(
     const piv_obj_id_t *obj_ids;
     CK_ULONG num_ids;
     get_token_object_ids(&obj_ids, &num_ids);
+    // Reused output buffer for every object (the APIs below always fill it and
+    // set their own length, so it does not need to be initialized on each pass).
+    CK_BYTE data[YKPIV_OBJ_MAX_SIZE]; // Max cert value for ykpiv
     for(CK_ULONG i = 0; i < num_ids; i++) {
       ykpiv_rc rc = YKPIV_KEY_ERROR;
       CK_BYTE sub_id = get_sub_id(obj_ids[i]);
@@ -988,7 +991,6 @@ CK_DEFINE_FUNCTION(CK_RV, C_OpenSession)(
       piv_obj_id_t pubk_id = find_pubk_object(sub_id);
       piv_obj_id_t pvtk_id = find_pvtk_object(sub_id);
       piv_obj_id_t atst_id = find_atst_object(sub_id);
-      CK_BYTE data[YKPIV_OBJ_MAX_SIZE] = {0}; // Max cert value for ykpiv
       size_t len;
       if(pvtk_id != PIV_INVALID_OBJ) {
         session->slot->origin[sub_id] = 0;
@@ -3503,7 +3505,7 @@ CK_DEFINE_FUNCTION(CK_RV, C_GenerateKeyPair)(
   piv_obj_id_t   pvtk_id;
   piv_obj_id_t   pubk_id;
   piv_obj_id_t   atst_id;
-  CK_BYTE        cert_data[YKPIV_OBJ_MAX_SIZE] = {0};
+  CK_BYTE        cert_data[YKPIV_OBJ_MAX_SIZE];
   CK_ULONG       cert_len;
   
   if (!pid) {
@@ -3626,7 +3628,7 @@ CK_DEFINE_FUNCTION(CK_RV, C_GenerateKeyPair)(
   // Create an attestation, if appropriate and able
 
   if(atst_id != PIV_INVALID_OBJ) {
-    unsigned char data[YKPIV_OBJ_MAX_SIZE] = {0};
+    unsigned char data[YKPIV_OBJ_MAX_SIZE];
     size_t len = sizeof(data);
     ykpiv_rc rc = ykpiv_attest(session->slot->piv_state, slot, data, &len);
     if(rc == YKPIV_OK) {

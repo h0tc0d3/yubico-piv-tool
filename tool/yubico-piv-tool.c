@@ -1910,7 +1910,7 @@ static void print_slot_info(ykpiv_state *state, enum enum_slot slot, const EVP_M
   bool cert_found = false, metadata_found = false;
 
   if(ykpiv_fetch_object(state, object, data, &len) == YKPIV_OK) {
-    unsigned char certdata[YKPIV_OBJ_MAX_SIZE * 10] = {0};
+    unsigned char certdata[YKPIV_OBJ_MAX_SIZE * 10];
     size_t certdata_len = sizeof(certdata);
     if(ykpiv_util_get_certdata(data, len, certdata, &certdata_len) != YKPIV_OK) {
       fprintf(output, "Failed to get certificate data\n");
