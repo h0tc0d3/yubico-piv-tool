@@ -1811,9 +1811,9 @@ static bool sign_file(ykpiv_state *state, const char *input, const char *output,
         fprintf(stderr, "Failed to initialize digest operation\n");
         goto out;
       }
-      while (!feof(input_file)) {
-        char buf[8192] = {0};
-        size_t len = fread(buf, 1, sizeof(buf), input_file);
+      char buf[8192];
+      size_t len;
+      while ((len = fread(buf, 1, sizeof(buf), input_file)) > 0) {
         if (EVP_DigestUpdate(mdctx, buf, len) != 1) {
           fprintf(stderr, "Failed to update digest data\n");
           goto out;
